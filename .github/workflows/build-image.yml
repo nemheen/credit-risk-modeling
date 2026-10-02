@@ -1,0 +1,19 @@
+name: Build image
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build-image:
+    runs-on: [self-hosted, prod, container]
+    steps:
+      - name: Checkout 🛎️
+        uses: actions/checkout@v2
+
+      - name: Docker build image
+        run: |
+          docker build -t ${{github.event.repository.name}}:${{github.ref_name}} .

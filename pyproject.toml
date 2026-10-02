@@ -1,0 +1,22 @@
+[tool.black]
+skip-string-normalization = true
+
+[tool.ruff]
+select = [
+    "E",   # pycodestyle
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "C",   # flake8-comprehensions
+    "PL",  # Pylint
+    "RUF", # Ruff-specific rules
+    "NPY", # NumPy-specific rules
+    "PD",  # pandas-vet
+]
+ignore = [
+    "E501", # line too long, handled by black1
+    "C901", # too complex
+]
+fix = true

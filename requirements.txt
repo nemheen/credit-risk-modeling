@@ -1,0 +1,12 @@
+oracledb==4.0.1
+numpy
+pandas==2.2.3
+scikit-learn
+scipy
+scorecardpy==0.1.9.7
+SQLAlchemy==2.0.45
+python-dateutil
+loguru==0.7.3
+setuptools==75.8.0
+python-dotenv==1.2.2
+pydantic-settings==2.14.2

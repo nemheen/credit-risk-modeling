@@ -1,0 +1,1035 @@
+"""
+score.py
+
+Single-script daily lease-collection scoring pipeline, designed to be
+imported by main.py for the production cron job:
+
+    from score import run_pipeline
+    run_pipeline()                    # scores today
+    run_pipeline(date(2026, 7, 5))    # backfill a specific date
+    run_pipeline(test=True)           # dry run — no writes, preview output
+    run_pipeline(score_only=True)     # skip query/export, read INPUT_TABLE directly
+
+No local caching: every run reads fresh from INPUT_TABLE and writes
+directly to OUTPUT_TABLE / LOG_TABLE. Only model artifacts (pkl/csv
+under MODEL_DIR) are read from disk — those are locked training
+artifacts, not run-time cache.
+
+Steps:
+  1. Build the feature-extraction SQL for p_date (query text untouched)
+  2. Run it against Oracle, export the result into INPUT_TABLE
+  3. Load the data back from INPUT_TABLE (source of truth for scoring)
+  4. Prepare features against locked training artifacts
+  5. Score (WOE transform -> scorecard -> bin -> probability)
+  6. Write scores into OUTPUT_TABLE
+  7. Grant SELECT on the pipeline tables to GRANTED_USERS
+  8. Write a run summary row into LOG_TABLE (always, even on failure)
+
+CLI flags:
+  --test    Dry run. ALL Oracle-mutating calls (DELETE, INSERT/export, GRANT)
+            are routed through safe_execute()/safe_export() below, which log
+            a preview instead of touching the database when test=True.
+            Scoring logic itself is completely unchanged — only writes are
+            skipped. Useful for validating a run end-to-end before it
+            touches production tables.
+  --score   Skip steps 1+2 (build/run the extraction query, export into
+            INPUT_TABLE) entirely. Assumes INPUT_TABLE is already populated
+            for p_date (e.g. from a prior full run, or backfilled some
+            other way) and jumps straight to step 3 (read_data) onward.
+            Useful for re-scoring after fixing a bug in score()/artifacts
+            without re-running the (slow) Oracle extraction query.
+
+  --test and --score can be combined: re-score from an already-populated
+  INPUT_TABLE and preview the output without writing anywhere.
+"""
+
+import argparse
+import json
+import logging
+import os
+import pickle
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+import oracledb
+import pandas as pd
+import scorecardpy as sc
+from dateutil.relativedelta import relativedelta
+from dotenv import load_dotenv
+from sklearn.preprocessing import KBinsDiscretizer
+
+from src.module.database import oracle_execute, oracle_export, oracle_import, sql_open
+from src.module.settings import Settings
+
+load_dotenv()
+
+log_startup = logging.getLogger(__name__)  # placeholder, real logger configured below
+
+# ── Logging setup ──────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("daily_pipeline.log", encoding="utf-8"),
+    ],
+)
+log = logging.getLogger(__name__)
+log.info("Oracle user: %s", Settings().oracle_username)
+
+# ── Paths & config ─────────────────────────────────────────────────────────
+# MODEL_DIR holds locked training artifacts (model/card/bins/kbd/features) —
+# these are read-only inputs, not run-time cache, so they stay on disk.
+MODEL_DIR = Path("src/models")
+
+INPUT_TABLE = "LEASE_COLLECTION_INPUT"
+OUTPUT_TABLE = "LEASE_COLLECTION_SCORE"
+LOG_TABLE = "LEASE_COLLECTION_LOG"
+
+ARTIFACT_NAMES = ["model", "card", "bins", "kbd", "features"]
+META_COLS = ["p_date", "userid", "borrowerid", "loanid"]
+GRANTED_USERS = ["NOMIN_N", "ENKHJIN_TU", "AMARJARGAL", "TOKI_BI", "TOKI"]
+LOG_COLS = [
+    "p_date",
+    "queried_loan_cnt",
+    "scored_loan_cnt",
+    "receivable_loan_cnt",
+    "query_startedat",
+    "query_completed",
+    "query_insertedat",
+    "scoredat",
+    "started_at",
+    "completed_at",
+    "status",
+    "error_message",
+]
+
+FEATURE_RENAME_MAP = {
+    "max_dpd_97_38": "base_max_dpd_97_38",
+    "stddev_days_late_all": "base_stddev_days_late_all",
+    "ontime_cnt_97_38": "base_ontime_cnt_97_38",
+    "avg_dpd_187_98": "base_avg_dpd_187_98",
+    "rep_cnt_187_98": "base_rep_cnt_187_98",
+    "avg_dpd_chg_37_8_vs_97_38": "base_avg_dpd_chg_37_8_vs_97_38",
+    "max_dpd_acceleration": "base_max_dpd_acceleration",
+    "trx_recency_l90d": "app_trx_recency_l90d",
+    "consistency_index": "cdr_consistency_index",
+    "recent_payment_concentration": "base_recent_payment_concentration",
+    "unpaid_rate_chg_187_98_vs_372_188": "base_unpaid_rate_chg_187_98_vs_372_188",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Centralized write gating — every Oracle-mutating call in this file (DELETE,
+# INSERT/export, GRANT) MUST go through one of these two functions, never
+# oracle_execute()/oracle_export() directly. This is the single place that
+# decides whether test=True actually blocks a write, so a future new write
+# path can't accidentally skip the check the way grant_select() once did.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def safe_execute(sql: str, test: bool, preview_label: str) -> bool:
+    """Guarded oracle_execute(). In test mode, logs the statement and returns
+    without touching the database. Returns True on success (or on a
+    test-mode no-op), False on failure."""
+    if test:
+        log.info("[TEST] Would execute -> %s:\n%s", preview_label, sql)
+        return True
+    try:
+        oracle_execute(sql)
+        return True
+    except Exception as e:
+        log.error("Execute failed (%s): %s", preview_label, e)
+        return False
+
+
+def safe_export(df: pd.DataFrame, table: str, test: bool, **kwargs) -> bool:
+    """Guarded oracle_export(). In test mode, logs a row-count + head preview
+    and returns without touching the database. Returns True on success (or
+    on a test-mode no-op), False on failure."""
+    if test:
+        log.info(
+            "[TEST] Would export %d rows -> %s (no write performed). Preview:",
+            len(df), table,
+        )
+        log.info("\n%s", df.head(10).to_string())
+        return True
+    try:
+        try:
+            oracle_export(df, table, **kwargs)
+        except TypeError:
+            oracle_export(df, table)
+        return True
+    except Exception as e:
+        log.error("Export failed -> %s: %s", table, e)
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Query construction — UNCHANGED from the version provided (do not edit SQL)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def grant_select(granted_users: list, test: bool = False) -> bool:
+    """Grant SELECT on INPUT_TABLE/OUTPUT_TABLE/LOG_TABLE to each user.
+    Fully routed through safe_execute() — in --test mode this only logs
+    what would be granted and never calls oracle_execute()."""
+    success = True
+
+    for u in granted_users:
+        for table in (INPUT_TABLE, OUTPUT_TABLE, LOG_TABLE):
+            ok = safe_execute(
+                f"GRANT SELECT ON {table} TO {u}",
+                test=test,
+                preview_label=f"grant SELECT on {table} to {u}",
+            )
+            if not ok:
+                success = False
+    return success
+
+
+def receivable_query(p_date):
+    if not hasattr(p_date, "strftime"):
+        raise ValueError("p_date must be a datetime")
+
+    p_date_py = p_date
+
+    # ── SQL literal ──
+    if hasattr(p_date, "strftime"):
+        p_date_sql = p_date.strftime("%Y-%m-%d")
+    else:
+        p_date_sql = str(p_date)
+    p_date_literal = f"DATE '{p_date_sql}'"
+
+    query = f"""
+    select distinct p_date, loan_id from toki.leasing_receivable where p_date = {p_date_literal} and overdue_days = 7
+    """
+    return query
+
+
+def format_query(p_date):
+    if not hasattr(p_date, "strftime"):
+        raise ValueError("p_date must be a datetime")
+
+    p_date_py = p_date
+
+    # ── SQL literal ──
+    if hasattr(p_date, "strftime"):
+        p_date_sql = p_date.strftime("%Y-%m-%d")
+    else:
+        p_date_sql = str(p_date)
+    p_date_literal = f"DATE '{p_date_sql}'"
+    p_curr_day = p_date_py.strftime("%d")
+    p_yesterday_ym = (p_date_py - timedelta(days=1)).strftime("%Y%m")
+    p_yesterday_day = (p_date_py - timedelta(days=1)).strftime("%d")
+
+    p_curr_ym_l1 = (p_date_py - relativedelta(years=1)).strftime("%Y%m")
+
+    p_curr_month = p_date_py.strftime("%Y%m")
+    p_last_month = (p_date_py.replace(day=1) - timedelta(days=1)).strftime("%Y%m")
+    p_last_2month = (
+        (p_date_py.replace(day=1) - timedelta(days=1)).replace(day=1)
+        - timedelta(days=1)
+    ).strftime("%Y%m")
+    p_last_3month = (
+        (
+            (p_date_py.replace(day=1) - timedelta(days=1)).replace(day=1)
+            - timedelta(days=1)
+        ).replace(day=1)
+        - timedelta(days=1)
+    ).strftime("%Y%m")
+
+    logging.info(f"Formatted date for query: {p_date_literal}")
+    logging.info(f"Current month: {p_curr_month}")
+    logging.info(f"Last Month: {p_last_month}, {p_last_2month}, {p_last_3month}")
+
+    query = f"""
+    WITH  DateLookbacks AS (
+        SELECT
+        {p_date_literal} AS analysis_date,
+        TO_CHAR({p_date_literal} - 7,  'YYYYMMDD') AS date_7d_ago_str,
+        TO_CHAR({p_date_literal} - 30, 'YYYYMMDD') AS date_30d_ago_str,
+        TO_CHAR({p_date_literal} - 60, 'YYYYMMDD') AS date_60d_ago_str,
+        TO_CHAR({p_date_literal} - 90, 'YYYYMMDD') AS date_90d_ago_str,
+        TO_CHAR({p_date_literal}, 'YYYYMMDD') AS today_str
+
+        FROM DUAL
+    ),
+    cdr as (
+        select b.id, user_id as userid, phone as phone,
+        CASE
+            WHEN NVL(c.CDR_COUNT90, 0) = 0 THEN NULL
+            ELSE NVL(c.CDR_COUNT30, 0) / NVL(c.CDR_COUNT90, 0)
+        END AS consistency_index
+
+        from toki.handset_borrower b
+        LEFT JOIN datawarehouse.t_cdr_count_complect_new  SUBPARTITION(CDR_COMPLECT_{p_yesterday_ym}_D{p_yesterday_day}) c  ON REGEXP_REPLACE(c.phone_no, '[^0-9]', '') = REGEXP_REPLACE(b.phone, '[^0-9]', '')
+
+    )
+    , trx_summary AS (
+        -- Moved CROSS JOIN inside to avoid repeated scalar subqueries in filters
+        SELECT
+            rt.userid,
+            MAX(rt.event_date_str) as last_trx
+
+        FROM (
+            SELECT CUSTOMER_IDENTIFIER AS userid, P_DATE AS event_date_str from
+            ( select CUSTOMER_IDENTIFIER,  amount, P_DATE, TRANSACTION_TYPE
+            FROM TOKI.DPR_TAJET_TELLER_TRANSACTIONS  partition(p_{p_curr_month})
+            union all
+            select  CUSTOMER_IDENTIFIER, amount, P_DATE, TRANSACTION_TYPE
+            FROM TOKI.DPR_TAJET_TELLER_TRANSACTIONS  partition(p_{p_last_month})
+            union all
+            select  CUSTOMER_IDENTIFIER, amount, P_DATE, TRANSACTION_TYPE
+            FROM TOKI.DPR_TAJET_TELLER_TRANSACTIONS  partition(p_{p_last_2month})
+            union all
+            select  CUSTOMER_IDENTIFIER, amount, P_DATE, TRANSACTION_TYPE
+            FROM TOKI.DPR_TAJET_TELLER_TRANSACTIONS  partition(p_{p_last_3month})
+
+            ), DateLookbacks dl
+            WHERE P_DATE >= dl.date_90d_ago_str and P_DATE < dl.today_str
+            AND (LOWER(TRANSACTION_TYPE) LIKE 'p2m%' OR LOWER(TRANSACTION_TYPE) LIKE 'p2p%' OR
+                LOWER(TRANSACTION_TYPE) LIKE 'sub%' OR TRANSACTION_TYPE IN ('BDPT', 'CWDL'))
+            AND TRANSACTION_TYPE NOT LIKE '%charge%'
+            AND AMOUNT > 0 AND CUSTOMER_IDENTIFIER IS NOT NULL
+
+            UNION ALL
+
+            SELECT user_id, TO_CHAR(TO_DATE(SUBSTR(paid_date_, 1, 10), 'YYYY-MM-DD'), 'YYYYMMDD')
+            FROM toki.bills_project_univision_orders, DateLookbacks dl
+            WHERE status = 'success' AND LOWER(PAYMENT_METHOD) IN ('upoint', 'both')
+            -- Avoid TO_DATE in filter if possible; using string comparison on YYYY-MM-DD
+            AND SUBSTR(paid_date_, 1, 10) >= TO_CHAR({p_date_literal} - 90, 'YYYY-MM-DD') and SUBSTR(paid_date_, 1, 10) < TO_CHAR({p_date_literal}, 'YYYY-MM-DD')
+            AND paid_amount > 0
+
+            UNION ALL
+
+            SELECT user_id,  P_DATE
+            FROM toki.bills_project_unitel_orders, DateLookbacks dl
+            WHERE P_DATE >= TO_CHAR({p_date_literal} - 90, 'YYYYMMDD') AND P_DATE < TO_CHAR({p_date_literal}, 'YYYYMMDD') AND status = 'success'
+            AND SUBSTR(BUYER_PHONE_NUMBER ,1,2) IN ('88','80','86','89','77')
+            AND PAYMENT_METHOD IN ('unit', 'addon', 'upoint', 'uloan')
+            AND PAID_AMOUNT > 0
+
+            UNION ALL
+
+            SELECT userid, TO_CHAR(createdat, 'YYYYMMDD')
+            FROM toki.mp_movie_orders, DateLookbacks dl
+            WHERE createdat >= {p_date_literal} - 90 AND createdat < {p_date_literal} AND LOWER(status) LIKE '%success%'
+            AND LOWER(paymenttype) NOT IN ('vod', 'toki')
+
+            UNION ALL
+
+            SELECT USER_ID, TO_CHAR(CREATEDAT, 'YYYYMMDD')
+            FROM toki.mobility_project_parking_invoices, DateLookbacks dl
+            WHERE CREATEDAT >= {p_date_literal} - 90 AND CREATEDAT < {p_date_literal} AND refund_amount = 'None'
+            AND payment_type = 'post-pay' AND pay = 'True'
+        ) rt
+
+        GROUP BY rt.userid
+    )
+    , base_loans AS (
+        SELECT DISTINCT
+            l.id          AS loanid,
+            l.borrower_id as borrowerid,
+            b.user_id as userid,
+            to_number(l.principal_amt) principal_amt,
+            trunc(l.loan_activated_date) as loan_activated_date,
+            to_number(l.MONTHLY_REPAYMENT_FREQUENCY) MONTHLY_REPAYMENT_FREQUENCY,
+            to_number(l.duration_months) duration_months,
+            TRUNC(b.created_date) AS borrower_createdat
+        -- select *
+        FROM toki.handset_loan  l
+        LEFT JOIN toki.handset_borrower b on b.id = l.borrower_id
+        WHERE l.status = 'ACTIVE' and l.INTEREST_RATE > 0
+        AND l.FIRST_PAYMENT_DATE <  {p_date_literal}
+    )
+    , partial_agg AS (
+
+        SELECT
+        i.loan_id,
+        i.invoice_id,
+
+        TO_DATE(i.due_date,'DD-MM-YY')        AS due_date,
+        TO_DATE(i.fully_paid_date,'DD-MM-YY') AS fully_paid_date,
+
+        /* invoice lateness */
+        CASE
+            WHEN TO_DATE(i.fully_paid_date,'DD-MM-YY') IS NULL
+            THEN {p_date_literal}  - TO_DATE(i.due_date,'DD-MM-YY')
+            WHEN TO_DATE(i.fully_paid_date,'DD-MM-YY')  > TO_DATE(i.due_date,'DD-MM-YY') and TO_DATE(i.fully_paid_date,'DD-MM-YY') > {p_date_literal}
+            THEN {p_date_literal}  - TO_DATE(i.due_date,'DD-MM-YY') ELSE 0
+        END AS late_days,
+
+        case when TO_DATE(i.due_date,'DD-MM-YY') between {p_date_literal} - 372 and {p_date_literal} - 188 then 'was_due_372_188'
+        when TO_DATE(i.due_date,'DD-MM-YY') between {p_date_literal} - 187 and {p_date_literal} - 98 then 'was_due_187_98'
+        when TO_DATE(i.due_date,'DD-MM-YY') between {p_date_literal} - 97 and {p_date_literal} - 38 then 'was_due_97_38'
+            when TO_DATE(i.due_date,'DD-MM-YY') between {p_date_literal} - 37 and {p_date_literal} - 8 then 'was_due_37_8'
+            when TO_DATE(i.due_date,'DD-MM-YY') > {p_date_literal} - 8 then 'was_due_7' else 'older_than_1y' end as inv_due_cat,
+
+        CASE WHEN count(distinct r.repayment_id) > 1 and sum(r.total_paid_amt) > 1000 then 1 else 0 end as is_partial,
+            max(i.total_fixed_invoice_amt) as total_fixed_invoice_amt, max(i.principal_amt) as principal_amt,
+            max(i.penalty_payment_amt) as penalty_payment_amt, max(i.interest_amt) as interest_amt
+    -- select *
+    FROM toki.handset_loan_invoice i
+
+    LEFT JOIN toki.handset_loan_repayment r ON r.loan_invoice_id = i.invoice_id AND r.created_date < {p_date_literal}
+
+    WHERE TO_DATE(i.due_date,'DD-MM-YY')   < {p_date_literal}
+
+    GROUP BY
+        i.loan_id,
+        i.invoice_id,
+        TO_DATE(i.due_date,'DD-MM-YY'),
+        TO_DATE(i.fully_paid_date,'DD-MM-YY'),  {p_date_literal}
+
+    ), bulk_agg AS ( -- as of loan
+        SELECT
+        i.loan_id,
+        r.repayment_id,
+
+        TO_DATE(r.created_date,'DD-MM-YY') AS repayment_date,
+
+        case when TO_DATE(r.created_date,'DD-MM-YY') between {p_date_literal} - 372 and {p_date_literal} - 188 then 'was_paid_372_188'
+        when TO_DATE(r.created_date,'DD-MM-YY') between {p_date_literal} - 187 and {p_date_literal} - 98 then 'was_paid_187_98'
+        when TO_DATE(r.created_date,'DD-MM-YY') between {p_date_literal} - 97 and {p_date_literal} - 38 then 'was_paid_97_38'
+            when TO_DATE(r.created_date,'DD-MM-YY') between {p_date_literal} - 37 and {p_date_literal} - 8 then 'was_paid_37_8'
+            when TO_DATE(r.created_date,'DD-MM-YY') > {p_date_literal} - 8 then 'was_paid_7' else 'paid_older_than_1y' end as rep_cat,
+
+        CASE WHEN count(distinct i.invoice_id) > 1 and sum(r.total_paid_amt) > 1000 then 1 else 0 end as is_bulk
+
+    FROM toki.handset_loan_invoice i
+
+    LEFT JOIN toki.handset_loan_repayment r ON r.loan_invoice_id = i.invoice_id AND r.created_date < {p_date_literal}
+
+    WHERE TO_DATE(i.due_date,'DD-MM-YY')   < {p_date_literal}
+    -- select * from toki.handset_loan_repayment where repayment_id = '40363'
+    GROUP BY
+        i.loan_id,
+        r.repayment_id,
+        TO_DATE(r.created_date,'DD-MM-YY'),  {p_date_literal}
+    )
+    , loan_agg AS (
+        SELECT bl.loanid, bl.borrowerid, bl.userid, bl.duration_months, bl.MONTHLY_REPAYMENT_FREQUENCY, bl.loan_activated_date,
+        bl.principal_amt,
+            -- {p_date_literal} - MAX(bl.borrower_createdat)    AS borrower_tenure,
+            COALESCE(MAX(p.late_days), 0)                               AS current_dpd,
+            COUNT(DISTINCT CASE WHEN p.inv_due_cat = 'was_due_372_188'
+                                AND p.fully_paid_date IS NOT NULL
+                                AND p.fully_paid_date between {p_date_literal} - 372 and {p_date_literal} - 188
+                                THEN p.invoice_id END)                  AS paid_cnt_372_188,
+            COUNT(DISTINCT CASE WHEN p.inv_due_cat = 'was_due_187_98'
+                                AND p.fully_paid_date IS NOT NULL
+                                AND p.fully_paid_date between {p_date_literal} - 187 and {p_date_literal} - 98
+                                THEN p.invoice_id END)                  AS paid_cnt_187_98,
+            COUNT(DISTINCT CASE WHEN p.inv_due_cat = 'was_due_97_38'
+                                AND p.fully_paid_date IS NOT NULL
+                                AND p.fully_paid_date  between {p_date_literal} - 97 and {p_date_literal} - 38
+                                THEN p.invoice_id END)                  AS paid_cnt_97_38,
+            COUNT(DISTINCT CASE WHEN p.inv_due_cat = 'was_due_37_8'
+                                AND p.fully_paid_date IS NOT NULL
+                                AND p.fully_paid_date between {p_date_literal} - 37 and {p_date_literal} - 8
+                                THEN p.invoice_id END)                  AS paid_cnt_37_8,
+              -- ontime paid per window (fully_paid_date <= due_date)
+            COUNT(DISTINCT CASE WHEN p.inv_due_cat = 'was_due_372_188'
+                                AND p.fully_paid_date IS NOT NULL
+                                AND p.fully_paid_date <= p.due_date
+                                THEN p.invoice_id END)                  AS ontime_cnt_372_188,
+            COUNT(DISTINCT CASE WHEN p.inv_due_cat = 'was_due_187_98'
+                                AND p.fully_paid_date IS NOT NULL
+                                AND p.fully_paid_date <= p.due_date
+                                THEN p.invoice_id END)                  AS ontime_cnt_187_98,
+            COUNT(DISTINCT CASE WHEN p.inv_due_cat = 'was_due_97_38'
+                                AND p.fully_paid_date IS NOT NULL
+                                AND p.fully_paid_date <= p.due_date
+                                THEN p.invoice_id END)                  AS ontime_cnt_97_38,
+            COUNT(DISTINCT CASE WHEN p.inv_due_cat = 'was_due_37_8'
+                                AND p.fully_paid_date IS NOT NULL
+                                AND p.fully_paid_date <= p.due_date
+                                THEN p.invoice_id END)                  AS ontime_cnt_37_8,
+
+            COUNT(DISTINCT CASE WHEN b.rep_cat = 'was_paid_372_188' THEN b.repayment_id END) AS rep_cnt_372_188,
+            COUNT(DISTINCT CASE WHEN b.rep_cat = 'was_paid_187_98'  THEN b.repayment_id END) AS rep_cnt_187_98,
+            COUNT(DISTINCT CASE WHEN b.rep_cat = 'was_paid_97_38'   THEN b.repayment_id END) AS rep_cnt_97_38,
+            COUNT(DISTINCT CASE WHEN b.rep_cat = 'was_paid_37_8'    THEN b.repayment_id END) AS rep_cnt_37_8,
+            COUNT(DISTINCT CASE WHEN b.rep_cat = 'was_paid_7'       THEN b.repayment_id END) AS rep_cnt_7,
+
+            -- unpaid at each window's snapshot date
+            COUNT(DISTINCT CASE WHEN p.inv_due_cat = 'was_due_372_188'
+                                AND (p.fully_paid_date IS NULL
+                                    OR p.fully_paid_date between {p_date_literal} - 372 and {p_date_literal} - 188)
+                                THEN p.invoice_id END)                  AS unpaid_cnt_372_188,
+
+            COUNT(DISTINCT CASE WHEN p.inv_due_cat = 'was_due_187_98'
+                                AND (p.fully_paid_date IS NULL
+                                    OR p.fully_paid_date between {p_date_literal} - 97 and {p_date_literal} )
+                                THEN p.invoice_id END)                  AS unpaid_cnt_187_98,
+            COUNT(DISTINCT CASE WHEN p.inv_due_cat = 'was_due_97_38'
+                                AND (p.fully_paid_date IS NULL
+                                    OR p.fully_paid_date between {p_date_literal} - 37 and {p_date_literal})
+                                THEN p.invoice_id END)                  AS unpaid_cnt_97_38,
+            COUNT(DISTINCT CASE WHEN p.inv_due_cat = 'was_due_37_8'
+                                AND (p.fully_paid_date IS NULL
+                                    OR p.fully_paid_date between {p_date_literal} - 7 and {p_date_literal})
+                                THEN p.invoice_id END)                  AS unpaid_cnt_37_8,
+
+
+            MAX(CASE WHEN p.inv_due_cat = 'was_due_187_98'  and p.fully_paid_date <= {p_date_literal}  and p.fully_paid_date > p.due_date THEN p.fully_paid_date - p.due_date else 0 END)  AS max_dpd_187_98,
+            MAX(CASE WHEN p.inv_due_cat = 'was_due_97_38'   and p.fully_paid_date <= {p_date_literal}  and p.fully_paid_date > p.due_date THEN p.fully_paid_date - p.due_date else 0 END)  AS max_dpd_97_38,
+            MAX(CASE WHEN p.inv_due_cat = 'was_due_37_8'    and p.fully_paid_date <= {p_date_literal}  and p.fully_paid_date > p.due_date THEN p.fully_paid_date - p.due_date else 0 END)  AS max_dpd_37_8,
+
+
+            AVG(CASE WHEN p.inv_due_cat = 'was_due_187_98'  and p.fully_paid_date <= {p_date_literal}  and p.fully_paid_date > p.due_date THEN p.fully_paid_date - p.due_date else 0 END)  AS avg_dpd_187_98,
+            AVG(CASE WHEN p.inv_due_cat = 'was_due_97_38'   and p.fully_paid_date <= {p_date_literal} and p.fully_paid_date > p.due_date THEN p.fully_paid_date - p.due_date else 0 END)  AS avg_dpd_97_38,
+            AVG(CASE WHEN p.inv_due_cat = 'was_due_37_8'    and p.fully_paid_date <= {p_date_literal}  and p.fully_paid_date > p.due_date THEN p.fully_paid_date - p.due_date else 0 END)  AS avg_dpd_37_8,
+
+            -- stddev of lateness across all windows: low = consistent, high = erratic
+            STDDEV(CASE WHEN p.fully_paid_date > p.due_date and p.fully_paid_date <=  {p_date_literal} THEN p.fully_paid_date - p.due_date END)       AS stddev_days_late_all
+
+
+
+        FROM base_loans bl
+        LEFT JOIN partial_agg p  ON p.loan_id     = bl.loanid
+        LEFT JOIN bulk_agg b ON b.loan_id = bl.loanid
+        GROUP BY {p_date_literal}, bl.loanid, bl.borrowerid, bl.userid, bl.duration_months, bl.MONTHLY_REPAYMENT_FREQUENCY, bl.loan_activated_date, bl.principal_amt
+    )
+
+    SELECT distinct a.*,
+    CASE
+            WHEN (
+                paid_cnt_372_188
+            + paid_cnt_187_98
+            + paid_cnt_97_38
+            + paid_cnt_37_8
+            ) = 0 THEN 0
+            ELSE (
+                paid_cnt_37_8
+            + paid_cnt_97_38
+            ) / (
+                paid_cnt_372_188
+            + paid_cnt_187_98
+            + paid_cnt_97_38
+            + paid_cnt_37_8
+            )
+        END AS recent_payment_concentration,
+
+        /* Average DPD trajectory */
+        avg_dpd_37_8 - avg_dpd_97_38  AS avg_dpd_chg_37_8_vs_97_38,
+
+        (
+            CASE
+                WHEN (paid_cnt_187_98 + unpaid_cnt_187_98) = 0
+                    OR (paid_cnt_187_98 + unpaid_cnt_187_98) IS NULL
+                THEN NULL
+                ELSE unpaid_cnt_187_98 /
+                    (paid_cnt_187_98 + unpaid_cnt_187_98)
+            END
+            -
+            CASE
+                WHEN (paid_cnt_372_188 + unpaid_cnt_372_188) = 0
+                    OR (paid_cnt_372_188 + unpaid_cnt_372_188) IS NULL
+                THEN NULL
+                ELSE unpaid_cnt_372_188 /
+                    (paid_cnt_372_188 + unpaid_cnt_372_188)
+            END
+        ) AS unpaid_rate_chg_187_98_vs_372_188,
+
+
+        /* DPD acceleration */
+        ( (NVL(max_dpd_37_8, 0) - NVL(max_dpd_97_38, 0)) - (NVL(max_dpd_97_38, 0) - NVL(max_dpd_187_98, 0)) ) AS max_dpd_acceleration,
+
+        /* Unpaid change */
+        unpaid_cnt_37_8 - unpaid_cnt_187_98 AS unpaid_chg_37_8_vs_187_98,
+        NVL({p_date_literal} - TO_DATE(t.last_trx, 'YYYYMMDD'), 91) AS trx_recency_l90d,
+
+        nvl(c.consistency_index, 0) as consistency_index
+
+    FROM loan_agg a
+    left join cdr c on c.userid = a.userid
+    left join trx_summary t on t.userid = a.userid
+    where current_dpd = 7
+    order by  loanid
+
+
+    """
+    return query
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Export / idempotent writes — all Oracle mutation routed through
+# safe_execute() / safe_export()
+# ─────────────────────────────────────────────────────────────────────────────
+def delete_existing_p_date(table: str, p_date: datetime, test: bool = False) -> None:
+    """Delete any existing rows for this p_date so reruns don't duplicate data.
+    In --test mode, safe_execute logs what would have been deleted instead
+    of executing anything."""
+    date_str = p_date.strftime("%Y-%m-%d")
+    ok = safe_execute(
+        f"DELETE FROM {table} WHERE p_date = TO_DATE('{date_str}', 'YYYY-MM-DD')",
+        test=test,
+        preview_label=f"delete existing p_date={date_str} from {table}",
+    )
+    if ok and not test:
+        log.info("Cleared existing p_date=%s rows from %s (if any)", date_str, table)
+    elif not ok:
+        # Table may not exist yet on first run — non-fatal, already logged by safe_execute.
+        pass
+
+
+def export_query(p_date, df, TARGET_TABLE, MAX_TEXT_LEN=4000, test: bool = False):
+    """In --test mode, builds the exact DataFrame that would be written
+    (same p_date/inserted_at columns, same text truncation) and logs a
+    preview instead of writing — no delete, no insert."""
+    if df is None or df.empty:
+        log.info(f"No rows for {p_date}")
+        return False
+
+    # prevent ORA-12899 on the current target table
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].astype(str).str.slice(0, MAX_TEXT_LEN)
+
+    df = df.copy()
+    df["p_date"] = pd.to_datetime(p_date)
+    cols = df.columns.tolist()
+    cols.remove("p_date")
+    df = df[["p_date"] + cols]
+    df["inserted_at"] = pd.to_datetime("now")
+
+    delete_existing_p_date(TARGET_TABLE, p_date, test=test)
+
+    start = time.time()
+    ok = safe_export(df, TARGET_TABLE, test=test, index=False, if_exists="append")
+
+    if test:
+        return ok
+
+    if ok:
+        log.info(
+            json.dumps(
+                {
+                    "date": p_date.strftime("%Y-%m-%d"),
+                    "type": "base",
+                    "step": "inserting",
+                    "duration": time.time() - start,
+                }
+            )
+        )
+    return ok
+
+
+def write_log(log_row: dict, p_date: datetime, test: bool = False) -> None:
+    """Write one summary row to LOG_TABLE. Never raises — logging failures
+    should not crash or mask the pipeline's real outcome. In --test mode,
+    no delete and no export happen; only a preview is logged."""
+    try:
+        log_df = pd.DataFrame([{c: log_row.get(c) for c in LOG_COLS}])
+
+        delete_existing_p_date(LOG_TABLE, p_date, test=test)
+        ok = safe_export(log_df, LOG_TABLE, test=test, index=False, if_exists="append")
+
+        if not test and ok:
+            log.info("Log row written -> %s", LOG_TABLE)
+    except Exception as e:
+        log.error("Failed to write log row to %s: %s", LOG_TABLE, e)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Load data back from INPUT_TABLE (source of truth for scoring)
+# ─────────────────────────────────────────────────────────────────────────────
+def read_data(p_date: datetime) -> pd.DataFrame:
+    """Load scoring input for p_date directly from INPUT_TABLE. No local cache."""
+    date_str = p_date.strftime("%Y-%m-%d")
+
+    query = f"""
+        SELECT *
+        FROM {INPUT_TABLE}
+        WHERE p_date = TO_DATE('{date_str}', 'YYYY-MM-DD')
+    """
+    log.info("Reading input data for p_date=%s from %s", date_str, INPUT_TABLE)
+    df = oracle_import(query)
+    df.columns = df.columns.str.lower()
+
+    if df.empty:
+        raise RuntimeError(f"No data found in {INPUT_TABLE} for p_date={date_str}")
+
+    log.info("Loaded %d rows, %d columns", len(df), len(df.columns))
+    return df
+
+
+def get_receivable_loan_count(p_date: datetime) -> int:
+    """Independent check against toki.leasing_receivable for the LOG_TABLE.
+    Read-only — not gated by test, since it never mutates anything."""
+    try:
+        df_recv = oracle_import(receivable_query(p_date))
+        df_recv.columns = df_recv.columns.str.lower()
+        if df_recv.empty:
+            return 0
+        if "loan_id" in df_recv.columns:
+            return int(df_recv["loan_id"].nunique())
+        return len(df_recv)
+    except Exception as e:
+        log.error("Receivable query failed for %s: %s", p_date, e)
+        return 0
+
+
+def write_scores(score_df: pd.DataFrame, p_date: datetime, test: bool = False) -> None:
+    """Write scores directly to Oracle. No local CSV backup.
+    In --test mode, no delete and no export happen; only a preview is logged."""
+    delete_existing_p_date(OUTPUT_TABLE, p_date, test=test)
+
+    ok = safe_export(score_df, OUTPUT_TABLE, test=test, index=False, if_exists="append")
+
+    if test:
+        return
+
+    if ok:
+        log.info("Written %d rows -> %s", len(score_df), OUTPUT_TABLE)
+    else:
+        raise RuntimeError(f"Oracle write to {OUTPUT_TABLE} failed for p_date={p_date}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Grants
+# ─────────────────────────────────────────────────────────────────────────────
+def grant_select(granted_users: list = None, test: bool = False) -> bool:
+    """Grant SELECT on INPUT_TABLE/OUTPUT_TABLE/LOG_TABLE to each user.
+    Fully routed through safe_execute() — in --test mode this only logs
+    what would be granted and never calls oracle_execute()."""
+    granted_users = granted_users if granted_users is not None else GRANTED_USERS
+    success = True
+
+    for u in granted_users:
+        for table in (INPUT_TABLE, OUTPUT_TABLE, LOG_TABLE):
+            ok = safe_execute(
+                f"GRANT SELECT ON {table} TO {u}",
+                test=test,
+                preview_label=f"grant SELECT on {table} to {u}",
+            )
+            if not ok:
+                success = False
+
+    return success
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Artifact management
+# ─────────────────────────────────────────────────────────────────────────────
+def load_artifacts(model_dir: Path = MODEL_DIR) -> dict:
+    loaded = {}
+    for name in ARTIFACT_NAMES[:-1]:  # all except features
+        path = model_dir / f"{name}.pkl"
+        if not path.exists():
+            raise FileNotFoundError(f"Artifact '{name}' not found in '{model_dir}'. Expected: {path}")
+        with open(path, "rb") as f:
+            loaded[name] = pickle.load(f)
+        log.debug("Loaded %s ← %s", name, path)
+
+    loaded["features"] = pd.read_csv(model_dir / "features.csv").iloc[:, 0].tolist()
+    log.info("All artifacts loaded '%s'", model_dir)
+    return loaded
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature preparation
+# ─────────────────────────────────────────────────────────────────────────────
+def prepare_features(df: pd.DataFrame, feature_list: list) -> tuple[pd.DataFrame, pd.DataFrame]:
+    df_feat = df.copy()
+    df_feat.rename(columns=FEATURE_RENAME_MAP, inplace=True)
+
+    missing_meta = [c for c in META_COLS if c not in df_feat.columns]
+    if missing_meta:
+        log.warning("Missing meta columns: %s — will be skipped", missing_meta)
+
+    missing_feats = [f for f in feature_list if f not in df_feat.columns]
+    if missing_feats:
+        raise ValueError(
+            f"Feature mismatch — these features are in the model but not in input data:\n"
+            f"  {missing_feats}"
+        )
+
+    df_meta = df_feat[[c for c in META_COLS if c in df_feat.columns]].copy()
+    df_features = df_feat[feature_list].copy()
+    for c in df_features.columns:
+        if c == "app_trx_recency_l90d":
+            df_features[c] = df_features[c].fillna(91)
+        else:
+            df_features[c] = df_features[c].fillna(0)
+
+    df_features.replace("None", 0, inplace=True)
+    df_features.replace([np.inf, -np.inf], 0, inplace=True)
+
+    log.info(
+        "Features prepared: %d rows x %d features | NaN filled with 0",
+        len(df_features), len(feature_list),
+    )
+    return df_meta, df_features
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scoring
+# ─────────────────────────────────────────────────────────────────────────────
+def score(df: pd.DataFrame, artifacts: dict, p_date: datetime) -> pd.DataFrame:
+    model = artifacts["model"]
+    card = artifacts["card"]
+    locked_bins = artifacts["bins"]
+    kbd = artifacts["kbd"]
+    feature_list = artifacts["features"]
+
+    df_meta, df_feat = prepare_features(df, feature_list)
+
+    df_feat_with_placeholder = df_feat.copy()
+    df_feat_with_placeholder["bad"] = 0  # placeholder — woebin_ply needs target col present
+    df_woe = sc.woebin_ply(df_feat_with_placeholder, locked_bins)
+
+    locked_woe_cols = [f + "_woe" for f in feature_list]
+    missing_woe = [c for c in locked_woe_cols if c not in df_woe.columns]
+    if missing_woe:
+        raise ValueError(f"WOE transform produced no columns for: {missing_woe}")
+
+    X_score = df_woe[locked_woe_cols]
+
+    score_df = sc.scorecard_ply(df_feat, card, print_step=0)
+
+    score_df["bins"] = (
+        10 - kbd.transform(score_df[["score"]]).astype(int).flatten()
+    ).clip(1, 10)  # guard against edge values outside training range
+
+    if not hasattr(model, "multi_class"):
+        model.multi_class = "auto"
+    score_df["probability"] = model.predict_proba(X_score)[:, 1].round(6)
+
+    score_df = pd.concat(
+        [df_meta.reset_index(drop=True), score_df.reset_index(drop=True)], axis=1
+    )
+    score_df["p_date"] = p_date
+    score_df["scored_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    score_df["scored_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    control_idx = score_df.sample(
+        frac=0.15,
+        random_state=42
+    ).index
+    control_mask = score_df.index.isin(control_idx)
+
+    score_df["is_control"] = None
+    score_df.loc[control_mask, "is_control"] = "Y"
+    score_df.loc[~control_mask, "is_control"] = "N"
+
+
+    if not score_df.empty:
+        log.info(
+            "Scored %d rows | score range: [%d, %d] | mean prob: %.4f",
+            len(score_df), score_df["score"].min(), score_df["score"].max(),
+            score_df["probability"].mean(),
+        )
+    return score_df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+def run_pipeline(p_date: datetime = None, test: bool = False, score_only: bool = False) -> None:
+    """
+    Run the daily scoring pipeline once for the provided date.
+    If p_date is None, defaults to today — intended entry point for main.py:
+
+        from score import run_pipeline
+        run_pipeline()                              # today
+        run_pipeline(date(2026,7,5))                 # backfill
+        run_pipeline(test=True)                      # dry run, no writes, preview output
+        run_pipeline(score_only=True)                # skip query/export, read INPUT_TABLE directly
+
+    test:       when True, every Oracle-mutating call (DELETE, INSERT/export,
+                GRANT) is routed through safe_execute()/safe_export(), which
+                log a preview instead of touching the database. Nothing
+                about the scoring logic itself changes.
+    score_only: when True, steps 1+2 (build/run the extraction query, export
+                into INPUT_TABLE) are skipped entirely. Assumes INPUT_TABLE
+                is already populated for p_date and jumps straight to step 3
+                (read_data) onward. Useful for re-scoring after fixing a bug
+                in score()/artifacts without re-running the Oracle extraction
+                query.
+    """
+    if p_date is None:
+        p_date = pd.Timestamp.now().date()
+
+    log.info("=" * 60)
+    log.info(
+        "Daily pipeline starting | p_date=%s | test=%s | score_only=%s",
+        p_date, test, score_only,
+    )
+    log.info("=" * 60)
+
+    stats = {
+        "p_date": p_date,
+        "queried_loan_cnt": None,
+        "scored_loan_cnt": None,
+        "receivable_loan_cnt": None,
+        "query_startedat": None,
+        "query_completed": None,
+        "query_insertedat": None,
+        "scoredat": None,
+        "started_at": datetime.now(),
+        "completed_at": None,
+        "status": "started",
+        "error_message": None,
+    }
+
+    try:
+        # ── Independent receivable check (doesn't block main flow) ──────
+        stats["receivable_loan_cnt"] = get_receivable_loan_count(p_date)
+
+        if not score_only:
+            # ── Step 1+2: build query, run it, export into INPUT_TABLE ──
+            query = format_query(p_date)
+            stats["query_startedat"] = datetime.now()
+            try:
+                start = time.time()
+                log.info("Importing query for %s...", p_date)
+                df_raw = oracle_import(query)
+
+                cols = {c.lower(): c for c in df_raw.columns}
+
+                if 'p_date' in cols and 'loanid' in cols:
+                    df_raw = df_raw.drop_duplicates(
+                        subset=[cols['p_date'], cols['loanid']]
+                    )
+
+                log.info(
+                    "Query imported for %s in %.2fs. Rows: %d",
+                    p_date, time.time() - start, len(df_raw),
+                )
+                stats["query_completed"] = datetime.now()
+            except Exception as exc:
+                log.error("Query execution failed for %s: %s", p_date, exc)
+                stats["status"] = "query_failed"
+                stats["error_message"] = str(exc)
+                return
+
+            if df_raw.empty:
+                log.warning("No rows returned from source query for p_date=%s — aborting", p_date)
+                stats["status"] = "no_data"
+                stats["queried_loan_cnt"] = 0
+                return
+
+            df_raw.columns = df_raw.columns.str.lower()
+
+            stats["queried_loan_cnt"] = (
+                int(df_raw["loanid"].nunique()) if "loanid" in df_raw.columns else len(df_raw)
+            )
+
+            if export_query(p_date, df_raw, TARGET_TABLE=INPUT_TABLE, test=test):
+                log.info("Export to %s successful for %s", INPUT_TABLE, p_date)
+                stats["query_insertedat"] = datetime.now()
+            else:
+                log.error("Export to %s failed for %s — aborting before scoring", INPUT_TABLE, p_date)
+                stats["status"] = "export_failed"
+                return
+        else:
+            log.info(
+                "--score: skipping query/export step, reading directly from %s for p_date=%s",
+                INPUT_TABLE, p_date,
+            )
+
+        # ── Step 3: reload from INPUT_TABLE (source of truth, not cache) ──
+        df = read_data(p_date)
+        df.drop_duplicates(inplace=True)
+
+        if df.empty:
+            log.warning("No rows found for p_date=%s after reload — nothing to score", p_date)
+            stats["status"] = "no_data_after_reload"
+            return
+        log.info("%d rows to score", len(df))
+
+        if score_only:
+            # queried_loan_cnt wasn't set above since step 1+2 was skipped —
+            # backfill it from what was actually read for an accurate log row.
+            stats["queried_loan_cnt"] = (
+                int(df["loanid"].nunique()) if "loanid" in df.columns else len(df)
+            )
+
+        # ── Step 4+5: features, artifacts, scoring ──────────────────────
+        artifacts = load_artifacts()
+        scored_df = score(df, artifacts, p_date)
+        scored_df.drop_duplicates(inplace=True)
+        stats["scoredat"] = datetime.now()
+
+        if scored_df.empty:
+            log.warning("Scoring produced 0 rows for p_date=%s — nothing to write", p_date)
+            stats["status"] = "scoring_empty"
+            return
+
+        stats["scored_loan_cnt"] = (
+            int(scored_df["loanid"].nunique()) if "loanid" in scored_df.columns else len(scored_df)
+        )
+
+        # ── Step 6: write to OUTPUT_TABLE ────────────────────────────────
+        write_scores(scored_df, p_date, test=test)
+
+        # ── Step 7: grant to GRANTED_USERS ────────────────────────────────
+        grant_select(granted_users=GRANTED_USERS, test=test)
+
+        stats["status"] = "success"
+
+        log.info("=" * 60)
+        log.info("Pipeline complete | p_date=%s | test=%s | score_only=%s", p_date, test, score_only)
+        log.info("  Total rows scored : %d", len(scored_df))
+        log.info("  Score range       : [%d, %d]", scored_df["score"].min(), scored_df["score"].max())
+        log.info("  Mean probability  : %.4f", scored_df["probability"].mean())
+        log.info("=" * 60)
+
+    except Exception as exc:
+        log.exception("Pipeline failed with an unhandled error for p_date=%s", p_date)
+        stats["status"] = "error"
+        stats["error_message"] = str(exc)
+        raise
+
+    finally:
+        stats["completed_at"] = datetime.now()
+        write_log(stats, p_date, test=test)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point (manual / ad-hoc runs — main.py should import run_pipeline directly)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Lease Collection Scorecard — Daily Scoring Pipeline"
+    )
+    parser.add_argument(
+        "--p_date",
+        type=str,
+        default=None,
+        help="Scoring date in YYYY-MM-DD format (default: today)",
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Dry run — no writes to INPUT_TABLE/OUTPUT_TABLE/LOG_TABLE and no GRANTs, "
+             "just log a preview of what would be written/executed",
+    )
+    parser.add_argument(
+        "--score",
+        action="store_true",
+        dest="score_only",
+        help="Skip querying Oracle and exporting to INPUT_TABLE; read directly from INPUT_TABLE "
+             "(must already be populated for --p_date) and score",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    log.info("Oracle user (env): %s", os.environ.get("ORACLE_USER"))
+    if args.p_date:
+        p_date = datetime.strptime(args.p_date, "%Y-%m-%d").date()
+    else:
+        p_date = pd.Timestamp.now().date()
+
+    run_pipeline(p_date=p_date, test=args.test, score_only=args.score_only)
